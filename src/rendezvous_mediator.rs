@@ -849,8 +849,10 @@ async fn start_ipv6(
     server: ServerPtr,
     control_permissions: Option<ControlPermissions>,
 ) -> bytes::Bytes {
+    // Discover local IPv6 GUA address (fast, no STUN).
+    // STUN runs inside get_ipv6_socket() on the actual hole-punching socket.
     crate::test_ipv6().await;
-    if let Some((socket, local_addr_v6)) = crate::get_ipv6_socket().await {
+    if let Some((socket, mapped_addr_v6)) = crate::get_ipv6_socket().await {
         let server = server.clone();
         tokio::spawn(async move {
             allow_err!(
@@ -864,7 +866,7 @@ async fn start_ipv6(
                 .await
             );
         });
-        return local_addr_v6;
+        return mapped_addr_v6;
     }
     Default::default()
 }
