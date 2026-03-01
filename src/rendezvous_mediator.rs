@@ -578,6 +578,11 @@ impl RendezvousMediator {
             return Ok(());
         }
         let peer_addr_v6 = hbb_common::AddrMangle::decode(&ph.socket_addr_v6);
+        if ph.socket_addr_v6.is_empty() {
+            log::warn!("PunchHole from hbbs has empty socket_addr_v6");
+        } else {
+            log::info!("PunchHole peer socket_addr_v6={}", peer_addr_v6);
+        }
         let relay = use_ws() || Config::is_proxy() || ph.force_relay;
         let mut socket_addr_v6 = Default::default();
         let control_permissions = ph.control_permissions.into_option();
@@ -589,6 +594,14 @@ impl RendezvousMediator {
                 control_permissions.clone(),
             )
             .await;
+            if socket_addr_v6.is_empty() {
+                log::warn!("start_ipv6 returned empty socket_addr_v6");
+            } else {
+                log::info!(
+                    "PunchHoleSent socket_addr_v6={} to hbbs",
+                    hbb_common::AddrMangle::decode(&socket_addr_v6)
+                );
+            }
         }
         let relay_server = self.get_relay_server(ph.relay_server);
         // for ensure, websocket go relay directly

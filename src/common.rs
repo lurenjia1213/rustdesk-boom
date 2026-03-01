@@ -2128,19 +2128,21 @@ async fn test_bind_ipv6() -> ResultType<SocketAddr> {
 /// Only does a local bind test (fast, no STUN). STUN is deferred to
 /// `get_ipv6_socket()` which runs on the actual hole-punching socket.
 pub async fn test_ipv6() {
-    if PUBLIC_IPV6_ADDR
-        .lock()
-        .unwrap()
-        .last_test_time
-        .map(|x| x.elapsed().as_secs() < 60)
-        .unwrap_or(false)
     {
-        return;
+        let info = PUBLIC_IPV6_ADDR.lock().unwrap();
+        let recently_tested = info
+            .last_test_time
+            .map(|x| x.elapsed().as_secs() < 60)
+            .unwrap_or(false);
+        // Only skip when we already have a usable cached IPv6 address.
+        // If cache is empty, keep retrying to avoid being stuck after a transient failure.
+        if recently_tested && info.local_addr.is_some() {
+            return;
+        }
     }
     {
         let mut info = PUBLIC_IPV6_ADDR.lock().unwrap();
         info.last_test_time = Some(Instant::now());
-        info.local_addr = None;
     }
 
     match test_bind_ipv6().await {
@@ -2295,13 +2297,53 @@ async fn stun_probe_on_socket(
 /// - `encoded_mapped_addr` is the STUN-discovered external address (reported to hbbs).
 /// Under NAT, the local and external addresses/ports may differ.
 pub async fn get_ipv6_socket() -> Option<(Arc<UdpSocket>, bytes::Bytes)> {
-    let bind_addr = PUBLIC_IPV6_ADDR.lock().unwrap().local_addr?;
+    fn is_usable_global_ipv6(addr: SocketAddr) -> bool {
+        if let std::net::IpAddr::V6(ip) = addr.ip() {
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && (ip.segments()[0] & 0xe000) == 0x2000
+        } else {
+            false
+        }
+    }
 
-    let socket = match UdpSocket::bind(bind_addr).await {
-        Ok(s) => s,
-        Err(err) => {
-            log::warn!("Failed to create UDP socket for IPv6: {err}");
-            return None;
+    let cached_addr = {
+        let addr = PUBLIC_IPV6_ADDR.lock().unwrap().local_addr;
+        if addr.is_some() {
+            addr
+        } else {
+            // Retry discovery once here to reduce false negatives caused by startup timing.
+            test_ipv6().await;
+            PUBLIC_IPV6_ADDR.lock().unwrap().local_addr
+        }
+    };
+
+    let socket = if let Some(bind_addr) = cached_addr {
+        match UdpSocket::bind(bind_addr).await {
+            Ok(s) => s,
+            Err(err) => {
+                log::warn!(
+                    "Failed to bind cached IPv6 addr {}: {}, fallback to [::]:0",
+                    bind_addr,
+                    err
+                );
+                match UdpSocket::bind(SocketAddr::from(([0u16; 8], 0))).await {
+                    Ok(s) => s,
+                    Err(err2) => {
+                        log::warn!("Failed to create fallback IPv6 UDP socket: {err2}");
+                        return None;
+                    }
+                }
+            }
+        }
+    } else {
+        match UdpSocket::bind(SocketAddr::from(([0u16; 8], 0))).await {
+            Ok(s) => s,
+            Err(err) => {
+                log::warn!("Failed to create UDP socket for IPv6: {err}");
+                return None;
+            }
         }
     };
 
@@ -2310,15 +2352,31 @@ pub async fn get_ipv6_socket() -> Option<(Arc<UdpSocket>, bytes::Bytes)> {
     // Single STUN flow on the actual hole-punching socket.
     // Same source port for STUN and hole punching — correct under any NAT type.
     // Pass local_addr so STUN can short-circuit when no NAT is detected.
-    let mapped_addrs = stun_probe_on_socket(&socket, Some(local_addr)).await;
+    let mapped_addrs = stun_probe_on_socket(
+        &socket,
+        if is_usable_global_ipv6(local_addr) {
+            Some(local_addr)
+        } else {
+            None
+        },
+    )
+    .await;
 
     let external_addr = if mapped_addrs.is_empty() {
-        // STUN failed — assume public IPv6 (most common), use local address.
-        log::debug!(
-            "IPv6 STUN failed, using local addr as external: {}",
+        if is_usable_global_ipv6(local_addr) {
+            // STUN failed — assume public IPv6 (most common), use local address.
+            log::debug!(
+                "IPv6 STUN failed, using local addr as external: {}",
+                local_addr
+            );
             local_addr
-        );
-        local_addr
+        } else {
+            log::warn!(
+                "IPv6 STUN failed and local addr is not usable global IPv6: {}, skip IPv6 punch",
+                local_addr
+            );
+            return None;
+        }
     } else if mapped_addrs.len() >= 2 {
         let all_same = mapped_addrs
             .iter()
@@ -2331,13 +2389,15 @@ pub async fn get_ipv6_socket() -> Option<(Arc<UdpSocket>, bytes::Bytes)> {
             );
             mapped_addrs[0]
         } else {
-            // Symmetric NAT — different servers see different mappings.
-            // Hole punching is infeasible.
+            // Symmetric/unstable mapping — different servers see different mappings.
+            // Keep best-effort IPv6 punching by advertising the first mapped address
+            // instead of disabling IPv6 entirely.
             log::warn!(
-                "IPv6 symmetric NAT detected (mapped addrs differ: {:?}), hole punching disabled",
-                mapped_addrs
+                "IPv6 STUN mapping differs across servers: {:?}, using first mapped address {} for best-effort punching",
+                mapped_addrs,
+                mapped_addrs[0]
             );
-            return None;
+            mapped_addrs[0]
         }
     } else {
         // Single STUN response — use it (works for both no-NAT and cone NAT).

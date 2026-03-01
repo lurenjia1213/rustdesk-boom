@@ -447,8 +447,16 @@ impl Client {
         // ipv6.1 = encoded external/mapped addr (reported to hbbs for peer to connect to)
         let mut ipv6 = if crate::get_ipv6_punch_enabled() {
             if let Some((socket, mapped_addr)) = crate::get_ipv6_socket().await {
+                let mapped = AddrMangle::decode(&mapped_addr);
+                log::info!(
+                    "IPv6 punch local socket ready, advertised mapped addr: {}",
+                    mapped
+                );
                 (Some(socket), Some(mapped_addr))
             } else {
+                log::warn!(
+                    "IPv6 punch enabled but get_ipv6_socket() returned None; socket_addr_v6 will be empty"
+                );
                 (None, None)
             }
         } else {
@@ -468,6 +476,15 @@ impl Client {
             socket_addr_v6: ipv6.1.unwrap_or_default(),
             ..Default::default()
         });
+        let req_v6 = msg_out.punch_hole_request().socket_addr_v6.clone();
+        if req_v6.is_empty() {
+            log::warn!("PunchHoleRequest socket_addr_v6 is empty");
+        } else {
+            log::info!(
+                "PunchHoleRequest socket_addr_v6={}",
+                AddrMangle::decode(&req_v6)
+            );
+        }
         for i in 1..=3 {
             log::info!(
                 "#{} {} punch attempt with {}, id: {}",
@@ -517,12 +534,26 @@ impl Client {
                                 }
                             }
                             let s = ipv6.0.take();
+                            if ph.socket_addr_v6.is_empty() {
+                                log::warn!(
+                                    "PunchHoleResponse socket_addr_v6 is empty from hbbs/peer"
+                                );
+                            } else {
+                                log::info!(
+                                    "PunchHoleResponse socket_addr_v6={}",
+                                    AddrMangle::decode(&ph.socket_addr_v6)
+                                );
+                            }
                             if !ph.socket_addr_v6.is_empty() && s.is_some() {
                                 let addr = AddrMangle::decode(&ph.socket_addr_v6);
                                 if addr.port() > 0 {
                                     if let Some(s) = s {
                                         allow_err!(s.connect(addr).await);
                                         ipv6.0 = Some(s);
+                                        log::info!(
+                                            "IPv6 UDP socket connected to peer addr {} from PunchHoleResponse",
+                                            addr
+                                        );
                                     }
                                 }
                             }
@@ -540,10 +571,15 @@ impl Client {
                         let mut connect_futures = Vec::new();
                         if let Some(s) = ipv6.0 {
                             let addr = AddrMangle::decode(&rr.socket_addr_v6);
+                            log::info!("RelayResponse socket_addr_v6={}", addr);
                             if addr.port() > 0 {
                                 if s.connect(addr).await.is_ok() {
                                     connect_futures
                                         .push(udp_nat_connect(s, "IPv6", CONNECT_TIMEOUT).boxed());
+                                    log::info!(
+                                        "IPv6 UDP socket connected to peer addr {} from RelayResponse",
+                                        addr
+                                    );
                                 }
                             }
                         }
