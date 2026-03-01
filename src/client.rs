@@ -304,12 +304,7 @@ impl Client {
         };
 
         if crate::get_ipv6_punch_enabled() {
-            if let Some(stun_task) = crate::test_ipv6().await {
-                // Wait for multi-server STUN to detect NAT type and external address.
-                // 4s covers the 3s STUN deadline + margin.
-                // If STUN doesn't finish, get_ipv6_socket() returns None (safe).
-                let _ = tokio::time::timeout(Duration::from_secs(4), stun_task).await;
-            }
+            crate::test_ipv6().await;
         }
 
         let (stop_udp_tx, stop_udp_rx) = oneshot::channel::<()>();
@@ -448,9 +443,11 @@ impl Client {
         // Stop UDP NAT test task if still running
         stop_udp_tx.map(|tx| tx.send(()));
         let mut msg_out = RendezvousMessage::new();
+        // ipv6.0 = local socket (bound to local GUA addr, used for sending)
+        // ipv6.1 = encoded external/mapped addr (reported to hbbs for peer to connect to)
         let mut ipv6 = if crate::get_ipv6_punch_enabled() {
-            if let Some((socket, addr)) = crate::get_ipv6_socket().await {
-                (Some(socket), Some(addr))
+            if let Some((socket, mapped_addr)) = crate::get_ipv6_socket().await {
+                (Some(socket), Some(mapped_addr))
             } else {
                 (None, None)
             }
