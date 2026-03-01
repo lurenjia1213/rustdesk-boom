@@ -568,44 +568,53 @@ impl Client {
                             rr.relay_server
                         );
                         start = Instant::now();
-                        let mut connect_futures = Vec::new();
-                        if let Some(s) = ipv6.0 {
+                        signed_id_pk = rr.pk().into();
+                        let relay_uuid = rr.uuid.clone();
+                        let relay_server = rr.relay_server.clone();
+
+                        let mut conn_and_type: Option<(Stream, Option<KcpStream>, &'static str)> = None;
+                        if let Some(s) = ipv6.0.take() {
                             let addr = AddrMangle::decode(&rr.socket_addr_v6);
                             log::info!("RelayResponse socket_addr_v6={}", addr);
                             if addr.port() > 0 {
                                 if s.connect(addr).await.is_ok() {
-                                    connect_futures
-                                        .push(udp_nat_connect(s, "IPv6", CONNECT_TIMEOUT).boxed());
                                     log::info!(
                                         "IPv6 UDP socket connected to peer addr {} from RelayResponse",
                                         addr
                                     );
+                                    let ipv6_first_timeout = std::cmp::min(CONNECT_TIMEOUT, 1500);
+                                    match udp_nat_connect(s, "IPv6", ipv6_first_timeout).await {
+                                        Ok(v) => {
+                                            conn_and_type = Some(v);
+                                            log::info!(
+                                                "RelayResponse branch established IPv6 first within {} ms",
+                                                ipv6_first_timeout
+                                            );
+                                        }
+                                        Err(e) => {
+                                            log::warn!(
+                                                "RelayResponse IPv6 first attempt failed in {} ms: {}",
+                                                ipv6_first_timeout,
+                                                e
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
-                        signed_id_pk = rr.pk().into();
-                        let fut = Self::create_relay(
-                            &peer,
-                            rr.uuid,
-                            rr.relay_server,
-                            &key,
-                            conn_type,
-                            my_addr.is_ipv4(),
-                        );
-                        connect_futures.push(
-                            async move {
-                                let conn = fut.await?;
-                                Ok((conn, None, if use_ws() { "WebSocket" } else { "Relay" }))
-                            }
-                            .boxed(),
-                        );
-                        // Run all connection attempts concurrently, return the first successful one
-                        let (conn, kcp, typ) = match select_ok(connect_futures).await {
-                            Ok(conn) => (Ok(conn.0 .0), conn.0 .1, conn.0 .2),
-
-                            Err(e) => (Err(e), None, ""),
-                        };
-                        let mut conn = conn?;
+                        if conn_and_type.is_none() {
+                            let conn = Self::create_relay(
+                                &peer,
+                                relay_uuid,
+                                relay_server,
+                                &key,
+                                conn_type,
+                                my_addr.is_ipv4(),
+                            )
+                            .await?;
+                            conn_and_type = Some((conn, None, if use_ws() { "WebSocket" } else { "Relay" }));
+                        }
+                        let (mut conn, kcp, typ) = conn_and_type.expect("conn_and_type must be set");
                         feedback = rr.feedback;
                         log::info!("{:?} used to establish {typ} connection", start.elapsed());
                         let pk =
