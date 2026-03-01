@@ -97,6 +97,7 @@ pub mod screenshot;
 pub const MILLI1: Duration = Duration::from_millis(1);
 pub const SEC30: Duration = Duration::from_secs(30);
 pub const VIDEO_QUEUE_SIZE: usize = 120;
+const RELAY_RACE_DELAY: Duration = Duration::from_millis(250);
 const MAX_DECODE_FAIL_COUNTER: usize = 3;
 
 #[cfg(target_os = "linux")]
@@ -569,52 +570,46 @@ impl Client {
                         );
                         start = Instant::now();
                         signed_id_pk = rr.pk().into();
-                        let relay_uuid = rr.uuid.clone();
-                        let relay_server = rr.relay_server.clone();
-
-                        let mut conn_and_type: Option<(Stream, Option<KcpStream>, &'static str)> = None;
+                        let mut connect_futures = Vec::new();
                         if let Some(s) = ipv6.0.take() {
                             let addr = AddrMangle::decode(&rr.socket_addr_v6);
                             log::info!("RelayResponse socket_addr_v6={}", addr);
-                            if addr.port() > 0 {
-                                if s.connect(addr).await.is_ok() {
-                                    log::info!(
-                                        "IPv6 UDP socket connected to peer addr {} from RelayResponse",
-                                        addr
-                                    );
-                                    let ipv6_first_timeout = std::cmp::min(CONNECT_TIMEOUT, 1500);
-                                    match udp_nat_connect(s, "IPv6", ipv6_first_timeout).await {
-                                        Ok(v) => {
-                                            conn_and_type = Some(v);
-                                            log::info!(
-                                                "RelayResponse branch established IPv6 first within {} ms",
-                                                ipv6_first_timeout
-                                            );
-                                        }
-                                        Err(e) => {
-                                            log::warn!(
-                                                "RelayResponse IPv6 first attempt failed in {} ms: {}",
-                                                ipv6_first_timeout,
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
+                            if addr.port() > 0 && s.connect(addr).await.is_ok() {
+                                connect_futures
+                                    .push(udp_nat_connect(s, "IPv6", CONNECT_TIMEOUT).boxed());
+                                log::info!(
+                                    "IPv6 UDP socket connected to peer addr {} from RelayResponse",
+                                    addr
+                                );
                             }
                         }
-                        if conn_and_type.is_none() {
-                            let conn = Self::create_relay(
-                                &peer,
-                                relay_uuid,
-                                relay_server,
-                                &key,
-                                conn_type,
-                                my_addr.is_ipv4(),
-                            )
-                            .await?;
-                            conn_and_type = Some((conn, None, if use_ws() { "WebSocket" } else { "Relay" }));
-                        }
-                        let (mut conn, kcp, typ) = conn_and_type.expect("conn_and_type must be set");
+
+                        let relay_uuid = rr.uuid.clone();
+                        let relay_server = rr.relay_server.clone();
+                        let key_for_relay = key.clone();
+                        let peer_for_relay = peer.clone();
+                        connect_futures.push(
+                            async move {
+                                tokio::time::sleep(RELAY_RACE_DELAY).await;
+                                let conn = Self::create_relay(
+                                    &peer_for_relay,
+                                    relay_uuid,
+                                    relay_server,
+                                    &key_for_relay,
+                                    conn_type,
+                                    my_addr.is_ipv4(),
+                                )
+                                .await?;
+                                Ok((conn, None, if use_ws() { "WebSocket" } else { "Relay" }))
+                            }
+                            .boxed(),
+                        );
+
+                        let (conn, kcp, typ) = match select_ok(connect_futures).await {
+                            Ok(conn) => (Ok(conn.0 .0), conn.0 .1, conn.0 .2),
+                            Err(e) => (Err(e), None, ""),
+                        };
+                        let mut conn = conn?;
                         feedback = rr.feedback;
                         log::info!("{:?} used to establish {typ} connection", start.elapsed());
                         let pk =
@@ -759,25 +754,52 @@ impl Client {
         if let Some(udp_socket_v6) = udp_socket_v6 {
             connect_futures.push(udp_nat_connect(udp_socket_v6, "IPv6", connect_timeout).boxed());
         }
+        if !interface.is_force_relay() && !relay_server.is_empty() {
+            let peer_id = peer_id.to_owned();
+            let relay_server = relay_server.to_owned();
+            let rendezvous_server = rendezvous_server.to_owned();
+            let key = key.to_owned();
+            let token = token.to_owned();
+            let relay_secure = !signed_id_pk.is_empty();
+            connect_futures.push(
+                async move {
+                    tokio::time::sleep(RELAY_RACE_DELAY).await;
+                    let conn = Self::request_relay(
+                        &peer_id,
+                        relay_server,
+                        &rendezvous_server,
+                        relay_secure,
+                        &key,
+                        &token,
+                        conn_type,
+                    )
+                    .await?;
+                    Ok((conn, None, "Relay"))
+                }
+                .boxed(),
+            );
+        }
         // Run all connection attempts concurrently, return the first successful one
         let (mut conn, kcp, mut typ) = match select_ok(connect_futures).await {
             Ok(conn) => (Ok(conn.0 .0), conn.0 .1, conn.0 .2),
             Err(e) => (Err(e), None, ""),
         };
 
-        let mut direct = !conn.is_err();
+        let mut direct = !conn.is_err() && typ != "Relay" && typ != "WebSocket";
         if interface.is_force_relay() || conn.is_err() {
             if !relay_server.is_empty() {
-                conn = Self::request_relay(
-                    peer_id,
-                    relay_server.to_owned(),
-                    rendezvous_server,
-                    !signed_id_pk.is_empty(),
-                    key,
-                    token,
-                    conn_type,
-                )
-                .await;
+                if interface.is_force_relay() || typ != "Relay" {
+                    conn = Self::request_relay(
+                        peer_id,
+                        relay_server.to_owned(),
+                        rendezvous_server,
+                        !signed_id_pk.is_empty(),
+                        key,
+                        token,
+                        conn_type,
+                    )
+                    .await;
+                }
                 if let Err(e) = conn {
                     // this direct is mainly used by on_establish_connection_error, so we update it here before bail
                     interface.update_direct(Some(false));

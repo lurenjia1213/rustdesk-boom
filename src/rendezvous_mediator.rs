@@ -32,6 +32,7 @@ use crate::{
 };
 
 type Message = RendezvousMessage;
+const DEDUP_WINDOW_MS: u128 = 100;
 
 lazy_static::lazy_static! {
     static ref SOLVING_PK_MISMATCH: Mutex<String> = Default::default();
@@ -420,7 +421,7 @@ impl RendezvousMediator {
         let last = *LAST_RELAY_MSG.lock().await;
         *LAST_RELAY_MSG.lock().await = (addr, Instant::now());
         // skip duplicate relay request messages
-        if last.0 == addr && last.1.elapsed().as_millis() < 100 {
+        if last.0 == addr && last.1.elapsed().as_millis() < DEDUP_WINDOW_MS {
             return Ok(());
         }
 
@@ -492,9 +493,10 @@ impl RendezvousMediator {
         let last = *LAST_MSG.lock().await;
         *LAST_MSG.lock().await = (addr, peer_addr_v6, Instant::now());
         // skip duplicate punch hole messages (match by IP pair, ignore short-lived port jitter)
-        if last.2.elapsed().as_millis() < 100
+        if last.2.elapsed().as_millis() < DEDUP_WINDOW_MS
             && last.0.ip() == addr.ip()
-            && ((last.1.port() == 0 && peer_addr_v6.port() == 0) || last.1.ip() == peer_addr_v6.ip())
+            && ((last.1.port() == 0 && peer_addr_v6.port() == 0)
+                || last.1.ip() == peer_addr_v6.ip())
         {
             return Ok(());
         }
@@ -582,9 +584,10 @@ impl RendezvousMediator {
         let last = *LAST_MSG.lock().await;
         *LAST_MSG.lock().await = (peer_addr, peer_addr_v6, Instant::now());
         // skip duplicate punch hole messages (match by IP pair, ignore short-lived port jitter)
-        if last.2.elapsed().as_millis() < 100
+        if last.2.elapsed().as_millis() < DEDUP_WINDOW_MS
             && last.0.ip() == peer_addr.ip()
-            && ((last.1.port() == 0 && peer_addr_v6.port() == 0) || last.1.ip() == peer_addr_v6.ip())
+            && ((last.1.port() == 0 && peer_addr_v6.port() == 0)
+                || last.1.ip() == peer_addr_v6.ip())
         {
             return Ok(());
         }
