@@ -304,10 +304,6 @@ impl Client {
             }
         };
 
-        if crate::get_ipv6_punch_enabled() {
-            crate::test_ipv6().await;
-        }
-
         let (stop_udp_tx, stop_udp_rx) = oneshot::channel::<()>();
         let udp =
         // no need to care about multiple rendezvous servers case, since it is acutally not used any more.

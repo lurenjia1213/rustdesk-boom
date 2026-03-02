@@ -589,7 +589,7 @@ impl Drop for CheckTestNatType {
 }
 
 pub fn test_nat_type() {
-    test_ipv6_sync();
+    //test_ipv6_sync();
     use std::sync::atomic::{AtomicBool, Ordering};
     std::thread::spawn(move || {
         static IS_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -2311,42 +2311,11 @@ pub async fn get_ipv6_socket() -> Option<(Arc<UdpSocket>, bytes::Bytes)> {
         }
     }
 
-    let cached_addr = {
-        let addr = PUBLIC_IPV6_ADDR.lock().unwrap().local_addr;
-        if addr.is_some() {
-            addr
-        } else {
-            // Retry discovery once here to reduce false negatives caused by startup timing.
-            test_ipv6().await;
-            PUBLIC_IPV6_ADDR.lock().unwrap().local_addr
-        }
-    };
-
-    let socket = if let Some(bind_addr) = cached_addr {
-        match UdpSocket::bind(bind_addr).await {
-            Ok(s) => s,
-            Err(err) => {
-                log::warn!(
-                    "Failed to bind cached IPv6 addr {}: {}, fallback to [::]:0",
-                    bind_addr,
-                    err
-                );
-                match UdpSocket::bind(SocketAddr::from(([0u16; 8], 0))).await {
-                    Ok(s) => s,
-                    Err(err2) => {
-                        log::warn!("Failed to create fallback IPv6 UDP socket: {err2}");
-                        return None;
-                    }
-                }
-            }
-        }
-    } else {
-        match UdpSocket::bind(SocketAddr::from(([0u16; 8], 0))).await {
-            Ok(s) => s,
-            Err(err) => {
-                log::warn!("Failed to create UDP socket for IPv6: {err}");
-                return None;
-            }
+    let socket = match UdpSocket::bind(SocketAddr::from(([0u16; 8], 0))).await {
+        Ok(s) => s,
+        Err(err) => {
+            log::warn!("Failed to create UDP socket for IPv6: {err}");
+            return None;
         }
     };
 
