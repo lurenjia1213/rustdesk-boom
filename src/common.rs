@@ -2243,6 +2243,7 @@ async fn stun_probe_on_socket(
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
 
     for stun_server in STUNS_V6.iter() {
+        //测试不同服务器
         if mapped_addrs.len() >= 2 {
             break;
         }
@@ -2263,25 +2264,11 @@ async fn stun_probe_on_socket(
 
         let client = StunClient::new(stun_addr);
         match tokio::time::timeout(per_server, client.query_external_address_async(socket)).await {
-            Ok(Ok(addr)) if addr.ip().is_ipv6() => {
+            Ok(Ok(addr)) => {
                 log::debug!("IPv6 STUN {} → mapped {}", stun_server, addr);
                 mapped_addrs.push(addr);
-                // If the first response shows local == mapped (no NAT),
-                // skip further probing — there's nothing to detect.
-                if mapped_addrs.len() == 1 {
-                    if let Some(local) = local_addr {
-                        if local.ip() == addr.ip() {
-                            log::debug!(
-                                "IPv6 STUN: local == mapped, no NAT, skipping further probes"
-                            );
-                            break;
-                        }
-                    }
-                }
             }
-            Ok(Ok(addr)) => {
-                log::debug!("IPv6 STUN {} returned non-IPv6: {}", stun_server, addr);
-            }
+
             Ok(Err(e)) => {
                 log::debug!("IPv6 STUN {} failed: {}", stun_server, e);
             }
@@ -2320,6 +2307,17 @@ pub async fn get_ipv6_socket() -> Option<(Arc<UdpSocket>, bytes::Bytes)> {
     };
 
     let local_addr = socket.local_addr().ok()?;
+    //公网直接跳过stun，直接用本地地址，洞都不用打
+    if is_usable_global_ipv6(local_addr) {
+        log::debug!(
+            "IPv6 socket: local={} (usable global IPv6, skipping STUN)",
+            local_addr
+        );
+        return Some((
+            Arc::new(socket),
+            hbb_common::AddrMangle::encode(local_addr).into(),
+        ));
+    }
 
     // Single STUN flow on the actual hole-punching socket.
     // Same source port for STUN and hole punching — correct under any NAT type.
