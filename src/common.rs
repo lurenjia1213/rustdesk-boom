@@ -2232,7 +2232,7 @@ fn test_ipv6_sync() {
 /// (no NAT), returns immediately without querying a second server.
 async fn stun_probe_on_socket(
     socket: &UdpSocket,
-    local_addr: Option<SocketAddr>,
+    //local_addr: Option<SocketAddr>,
 ) -> Vec<SocketAddr> {
     use std::net::ToSocketAddrs;
     use stunclient::StunClient;
@@ -2283,10 +2283,8 @@ async fn stun_probe_on_socket(
 /// - `encoded_mapped_addr` is the STUN-discovered external address (reported to hbbs).
 /// Under NAT, the local and external addresses/ports may differ.
 pub async fn get_ipv6_socket() -> Option<(Arc<UdpSocket>, bytes::Bytes)> {
-    fn is_usable_global_ipv6(addr: SocketAddr) -> bool {
-        //test_ipv6里面做了这个操作，所以说会失败也不意外
-        //前面的智障代码一定会导致bind失败，所以要不干脆这个
-        if let std::net::IpAddr::V6(ip) = addr.ip() {
+    fn is_usable_global_ipv6(addr: std::net::IpAddr) -> bool {
+        if let std::net::IpAddr::V6(ip) = addr {
             !ip.is_loopback()
                 && !ip.is_unspecified()
                 && !ip.is_multicast()
@@ -2294,6 +2292,15 @@ pub async fn get_ipv6_socket() -> Option<(Arc<UdpSocket>, bytes::Bytes)> {
         } else {
             false
         }
+    }
+    fn route_probe_ipv6() -> Option<std::net::IpAddr> {
+        let addr: SocketAddr = "[2606:4700:49::]:3478".parse().ok()?;
+        let socket = std::net::UdpSocket::bind(SocketAddr::from(([0u16; 8], 0))).ok()?;
+        socket
+            .connect(addr)
+            .map_err(|e| log::debug!("route probe fail"))
+            .ok()?;
+        socket.local_addr().ok().map(|a| a.ip())
     }
 
     let socket = match UdpSocket::bind(SocketAddr::from(([0u16; 8], 0))).await {
@@ -2304,48 +2311,36 @@ pub async fn get_ipv6_socket() -> Option<(Arc<UdpSocket>, bytes::Bytes)> {
         }
     };
 
-    let local_addr = socket.local_addr().ok()?;
+    //路由选源
+
+    let local_addr_ip = route_probe_ipv6()?;
     //公网直接跳过stun，直接用本地地址，洞都不用打
-    if is_usable_global_ipv6(local_addr) {
+    if is_usable_global_ipv6(local_addr_ip) {
+        let socket_port = socket.local_addr().ok()?.port();
+        let external_addr = SocketAddr::new(local_addr_ip, socket_port);
         log::debug!(
-            "IPv6 socket: local={} (usable global IPv6, skipping STUN)",
-            local_addr
+            "IPv6 socket: local={} (usable global IPv6, skipping STUN), external={}",
+            local_addr_ip,
+            external_addr
         );
         return Some((
             Arc::new(socket),
-            hbb_common::AddrMangle::encode(local_addr).into(),
+            hbb_common::AddrMangle::encode(external_addr).into(),
         ));
     }
 
+    log::debug!("IPv6 socket: local={} (not gua)", local_addr_ip);
     // Single STUN flow on the actual hole-punching socket.
     // Same source port for STUN and hole punching — correct under any NAT type.
     // Pass local_addr so STUN can short-circuit when no NAT is detected.
-    let mapped_addrs = stun_probe_on_socket(
-        &socket,
-        if is_usable_global_ipv6(local_addr) {
-            Some(local_addr)
-        } else {
-            None
-        },
-    )
-    .await;
+    let mapped_addrs = stun_probe_on_socket(&socket).await;
 
-    let external_addr = if mapped_addrs.is_empty() {
-        if is_usable_global_ipv6(local_addr) {
-            // STUN failed — assume public IPv6 (most common), use local address.
-            log::debug!(
-                "IPv6 STUN failed, using local addr as external: {}",
-                local_addr
-            );
-            local_addr
-        } else {
-            log::warn!(
-                "IPv6 STUN failed and local addr is not usable global IPv6: {}, skip IPv6 punch",
-                local_addr
-            );
-            return None;
-        }
-    } else if mapped_addrs.len() >= 2 {
+    if mapped_addrs.is_empty() {
+        log::warn!("Failed to get IPv6 mapping from STUN");
+        return None;
+    }
+
+    let external_addr = if mapped_addrs.len() >= 2 {
         let all_same = mapped_addrs
             .iter()
             .all(|a| a.ip() == mapped_addrs[0].ip() && a.port() == mapped_addrs[0].port());
@@ -2375,7 +2370,7 @@ pub async fn get_ipv6_socket() -> Option<(Arc<UdpSocket>, bytes::Bytes)> {
 
     log::debug!(
         "IPv6 socket: local={}, external={} (reported to hbbs)",
-        local_addr,
+        local_addr_ip,
         external_addr
     );
     Some((
